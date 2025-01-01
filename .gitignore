@@ -1,0 +1,7 @@
+watermark_locations.csv
+__pycache__/
+checkpoints/temp/
+checkpoints/convnext-tiny_watermarks_detector.pth
+debug/
+watermark_results/
+watermarked_videos/
