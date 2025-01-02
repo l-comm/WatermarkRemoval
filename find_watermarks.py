@@ -102,8 +102,6 @@ def ensure_file_exists(file_path, url):
     if not file_path.exists():
         logger.info(f"{file_path.name} not found. Downloading from HuggingFace...")
         download_file(url, file_path)
-    else:
-        logger.info(f"{file_path.name} already exists.")
 
 def save_pixel_values_as_video(pixel_values, output_path):
     """
