@@ -1,11 +1,14 @@
 # find_watermarks.py
+
 import logging
+import requests
 from rich.logging import RichHandler
 from rich.console import Console
 import os
 from pathlib import Path
 import csv
 import cv2
+from tqdm import tqdm
 import imageio
 import numpy as np
 import torch
@@ -30,19 +33,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global models
+predictor = None
+b2ab = None
+
 current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
 checkpoint_dir = os.path.join(current_dir, "checkpoints")
 assets_dir = os.path.join(current_dir, "assets")
-
-# Initialization
-device = 'cuda:0'
-weights = torch.load(os.path.join(checkpoint_dir, "convnext-tiny_watermarks_detector.pth"), device)
-predictor = WatermarkDetector(weights, device=device)
-predictor.model.eval()
-
-b2ab = BrightnessToAlphaBeta()
-b2ab.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'brightness_predictor.pth'))['model_state_dict'])
-b2ab.eval()
 
 # Load your templates/masks once
 border_map = cv2.imread(os.path.join(assets_dir, 'shutter_border_sm.png'), cv2.IMREAD_GRAYSCALE)
@@ -53,13 +50,60 @@ body_tensor = torch.from_numpy(body_map).float() / 255.0      # Shape: [H, W]
 template = body_map
 _, mask = cv2.threshold(template, 6, 255, cv2.THRESH_BINARY)
 
-# Directory with videos
-video_dir = os.path.join(current_dir, 'watermarked_videos')
-video_files = [f for f in os.listdir(video_dir) if os.path.isfile(os.path.join(video_dir, f))]
-
 # Directory for results
 results_dir = os.path.join(current_dir,'watermark_results')
 os.makedirs(results_dir, exist_ok=True)
+
+def load_models():
+    global predictor, b2ab
+    WATERMARK_DETECTOR_URL = "https://huggingface.co/boomb0om/watermark-detectors/resolve/main/convnext-tiny_watermarks_detector.pth"
+    watermark_model_location = Path(os.path.join(checkpoint_dir, "convnext-tiny_watermarks_detector.pth"))
+    brightness_model_location =Path(os.path.join(checkpoint_dir, 'brightness_predictor.pth'))
+    
+    ensure_file_exists(watermark_model_location, WATERMARK_DETECTOR_URL)
+    device = 'cuda:0'
+    if predictor is None:
+        weights = torch.load(watermark_model_location, device)
+        predictor = WatermarkDetector(weights, device=device)
+        predictor.model.eval()
+    if b2ab is None:
+        b2ab = BrightnessToAlphaBeta()
+        b2ab.load_state_dict(torch.load(brightness_model_location)['model_state_dict'])
+        b2ab.eval()
+    
+
+def download_file(url, dest_path):
+    """
+    Downloads a file from the specified URL to the destination path with a progress bar.
+    """
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
+        with open(dest_path, 'wb') as f, tqdm(
+            desc=f"Downloading {dest_path.name}",
+            total=total_size,
+            unit='iB',
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar:
+            for data in response.iter_content(chunk_size=1024):
+                size = f.write(data)
+                bar.update(size)
+        logger.info(f"Downloaded {dest_path.name} successfully.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download {url}: {e}")
+        raise
+
+def ensure_file_exists(file_path, url):
+    """
+    Ensures that the file exists locally; downloads it from the URL if it does not.
+    """
+    if not file_path.exists():
+        logger.info(f"{file_path.name} not found. Downloading from HuggingFace...")
+        download_file(url, file_path)
+    else:
+        logger.info(f"{file_path.name} already exists.")
 
 def save_pixel_values_as_video(pixel_values, output_path):
     """
@@ -136,7 +180,8 @@ def remove_watermark_batch(
         torch.Tensor: Corrected video frames of shape (b, c, H, W).
     """
     with torch.no_grad():
-        global body_tensor, border_tensor
+        global body_tensor, border_tensor, predictor, b2ab
+        load_models()
         # Ensure batch_frames are in float for processing
         if batch_frames.dtype != torch.float32:
             batch_frames = batch_frames.float()
@@ -220,6 +265,8 @@ def remove_watermark_batch(
     return corrected_frames
 
 def find_watermark_frame_cv(original_color):
+    global predictor, b2ab
+    load_models()
     # Convert to grayscale
     original_gray = cv2.cvtColor(original_color, cv2.COLOR_BGR2GRAY)
 
@@ -360,6 +407,13 @@ def pos_within_limits(x, y):
     return True
 
 def find_watermark_test_cv():
+    global predictor, b2ab
+    load_models()
+    
+    # Directory with videos
+    video_dir = os.path.join(current_dir, 'watermarked_videos')
+    video_files = [f for f in os.listdir(video_dir) if os.path.isfile(os.path.join(video_dir, f))]
+    
     # Prepare CSV file
     csv_path = os.path.join(current_dir,'watermark_locations.csv')
 
@@ -397,6 +451,10 @@ def find_watermark_test_cv():
             print(f"Corrected image saved at {corrected_image_path}")
 
 def find_watermark_test_tensor():
+    # Directory with videos
+    video_dir = os.path.join(current_dir, 'watermarked_videos')
+    video_files = [f for f in os.listdir(video_dir) if os.path.isfile(os.path.join(video_dir, f))]
+    
     sample_n_frames = 24
     target_fps = 24
     fit_to = 336
