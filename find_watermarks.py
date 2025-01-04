@@ -67,7 +67,7 @@ def load_models():
     if predictor is None:
         weights = torch.load(watermark_model_location, device)
         predictor = WatermarkDetector(weights, device=device)
-        predictor.to(device)
+        predictor.model.to(device)
         predictor.model.eval()
     if b2ab is None:
         b2ab = BrightnessToAlphaBeta()
