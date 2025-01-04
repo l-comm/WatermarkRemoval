@@ -145,8 +145,8 @@ def remove_watermark_cv(original_color, x, y, log = False):
     h, w = border_map.shape
     roi_gray = original_gray[y:y+h, x:x+w].astype(np.float32)
 
-    brightness = torch.tensor(roi_gray.mean(axis=(0,1))/255.).float().unsqueeze(0).unsqueeze(1)
-    alpha_beta = b2ab(brightness).squeeze(0).detach().numpy()
+    brightness = torch.tensor(roi_gray.mean(axis=(0,1))/255.).float().unsqueeze(0).unsqueeze(1).to('cuda')
+    alpha_beta = b2ab(brightness).squeeze(0).detach().cpu().numpy()
     alpha = alpha_beta[0]
     beta = alpha_beta[1]
     corrected_roi = roi_gray - alpha*border_map.astype(np.float32) + beta*body_map.astype(np.float32)
@@ -296,7 +296,7 @@ def find_watermark_frame_cv(original_color):
             
             corrected_image = remove_watermark_cv(original_color, x, y)
             rgb_image = cv2.cvtColor(corrected_image, cv2.COLOR_BGR2RGB)
-            rgb_tensor = torch.from_numpy(rgb_image)
+            rgb_tensor = torch.from_numpy(rgb_image).to("cuda")
 
             result_prob = predictor.predict_tensor(rgb_tensor)
             # logger.info(f"Trying {x} {y} = {result_prob}")
