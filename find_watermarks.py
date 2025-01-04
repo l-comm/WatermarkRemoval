@@ -46,6 +46,8 @@ border_map = cv2.imread(os.path.join(assets_dir, 'shutter_border_sm.png'), cv2.I
 body_map = cv2.imread(os.path.join(assets_dir, 'shutter_text_sm.png'), cv2.IMREAD_GRAYSCALE)
 border_tensor = torch.from_numpy(border_map).float() / 255.0  # Shape: [H, W]
 body_tensor = torch.from_numpy(body_map).float() / 255.0      # Shape: [H, W]
+border_tensor = border_tensor.to('cuda')
+body_tensor = body_tensor.to('cuda')
 
 template = body_map
 _, mask = cv2.threshold(template, 6, 255, cv2.THRESH_BINARY)
@@ -58,19 +60,20 @@ def load_models():
     global predictor, b2ab
     WATERMARK_DETECTOR_URL = "https://huggingface.co/boomb0om/watermark-detectors/resolve/main/convnext-tiny_watermarks_detector.pth"
     watermark_model_location = Path(os.path.join(checkpoint_dir, "convnext-tiny_watermarks_detector.pth"))
-    brightness_model_location =Path(os.path.join(checkpoint_dir, 'brightness_predictor.pth'))
+    brightness_model_location = Path(os.path.join(checkpoint_dir, 'brightness_predictor.pth'))
     
     ensure_file_exists(watermark_model_location, WATERMARK_DETECTOR_URL)
-    device = 'cuda:0'
+    device = 'cuda'
     if predictor is None:
         weights = torch.load(watermark_model_location, device)
         predictor = WatermarkDetector(weights, device=device)
+        predictor.to(device)
         predictor.model.eval()
     if b2ab is None:
         b2ab = BrightnessToAlphaBeta()
         b2ab.load_state_dict(torch.load(brightness_model_location)['model_state_dict'])
+        b2ab.to(device)
         b2ab.eval()
-    
 
 def download_file(url, dest_path):
     """
@@ -181,8 +184,8 @@ def remove_watermark_batch(
         global body_tensor, border_tensor, predictor, b2ab
         load_models()
         # Ensure batch_frames are in float for processing
-        if batch_frames.dtype != torch.float32:
-            batch_frames = batch_frames.float()
+        device = 'cuda'
+        batch_frames = batch_frames.to(device, dtype=torch.float32)
 
         b, c, H, W = batch_frames.shape
         h, w = border_tensor.shape
@@ -206,8 +209,6 @@ def remove_watermark_batch(
 
         # Reshape brightness for model input
         brightness = brightness.unsqueeze(1)  # Shape: (b, 1)
-
-        logger.info(f"brightness {brightness[0][0]}")
 
         # Pass brightness through the model to get alpha and beta
         alpha_beta = b2ab(brightness)  # Shape: (b, 2)
@@ -365,6 +366,8 @@ def find_watermark_video(video_url, frame_range = range(0, 24, 5)):
 def find_watermark_tensor(pixel_values, frame_range = range(0, 24, 5)):
     # We'll store results from each frame in this list
     frame_positions = [] 
+    device='cuda'
+    pixel_values = pixel_values.to(device)
     
     total_frames, _, _, _ = pixel_values.shape
     for frame_idx in frame_range:
