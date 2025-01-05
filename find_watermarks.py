@@ -50,7 +50,10 @@ border_tensor = border_tensor.to('cuda')
 body_tensor = body_tensor.to('cuda')
 
 template = body_map
+template_tensor = body_tensor
 _, mask = cv2.threshold(template, 6, 255, cv2.THRESH_BINARY)
+
+mask_tensor = (template_tensor > 6.0/255.0).float()
 
 # Directory for results
 results_dir = os.path.join(current_dir,'watermark_results')
@@ -128,6 +131,108 @@ def save_pixel_values_as_video(pixel_values, output_path):
         writer.close()
 
     logger.info(f"Video saved as {output_path}")
+
+def match_template_torch(
+    image: torch.Tensor,
+    template: torch.Tensor,
+    mask: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    Naïve PyTorch implementation of cv2.matchTemplate with method=cv2.TM_CCOEFF_NORMED.
+
+    Args:
+        image:   [H, W]   or [1, H, W]   float tensor, grayscale image.
+        template:[th, tw] or [1, th, tw] float tensor, grayscale template.
+        mask:    [th, tw] or [1, th, tw] float tensor in {0,1}, optional.
+
+    Returns:
+        A float tensor of shape [H - th + 1, W - tw + 1] containing
+        the normalized cross-correlation result at each valid (x,y).
+
+    Note:
+        - If input is [C,H,W], C must be 1 (grayscale).
+        - This code is NOT optimized for large images or large templates!
+        - Make sure to use float tensors for exact matching with OpenCV.
+    """
+    
+    # Ensure image and template are [H, W] shape, drop channel dimension if present
+    if image.dim() == 3 and image.size(0) == 1:
+        image = image.squeeze(0)
+    if template.dim() == 3 and template.size(0) == 1:
+        template = template.squeeze(0)
+    if mask is not None and mask.dim() == 3 and mask.size(0) == 1:
+        mask = mask.squeeze(0)
+
+    # Convert to float (if not already)
+    image    = image.float()
+    template = template.float()
+    if mask is not None:
+        mask = mask.float()
+
+    H,  W  = image.shape
+    th, tw = template.shape
+
+    # Prepare mask
+    if mask is None:
+        # Use a mask of all ones (same shape as template)
+        mask = torch.ones_like(template)
+    
+    # Make sure mask is binary in {0,1}
+    mask = (mask > 0).float()
+
+    # Number of valid (unmasked) pixels in the template
+    # shape: scalar
+    valid_count_template = mask.sum()
+
+    # If template is entirely masked out or has 0 valid pixels, avoid division by zero
+    if valid_count_template.item() < 1:
+        raise ValueError("Template mask has zero valid pixels.")
+
+    # Compute mean and "centered" template (masked)
+    # shape of t_mean: scalar
+    t_mean = (template * mask).sum() / valid_count_template
+    # shape: [th, tw]
+    t_centered = (template - t_mean) * mask
+    # sum of squares of the centered template
+    # shape: scalar
+    t_sum_sq = (t_centered ** 2).sum()
+
+    # Output correlation map
+    out_h = H - th + 1
+    out_w = W - tw + 1
+    result = torch.empty((out_h, out_w), dtype=torch.float32)
+
+    # Slide the template over image
+    for y in range(out_h):
+        for x in range(out_w):
+            # Extract the current patch from the image
+            # shape: [th, tw]
+            patch = image[y:y+th, x:x+tw]
+
+            # Compute the mask-aware mean of this patch
+            valid_count_patch = mask.sum()
+            i_mean = (patch * mask).sum() / valid_count_patch
+
+            # Center the patch by subtracting its mean (only where mask==1)
+            i_centered = (patch - i_mean) * mask
+
+            # Cross-term in numerator
+            numerator = (t_centered * i_centered).sum()
+
+            # Denominator is the product of sqrt of sums of squares
+            i_sum_sq = (i_centered ** 2).sum()
+            denominator = torch.sqrt(t_sum_sq * i_sum_sq + 1e-12)
+
+            # Avoid division by zero if patch is constant
+            if denominator.item() == 0.0:
+                # If the patch is fully masked or has zero variance, set correlation to 0
+                correlation = 0.0
+            else:
+                correlation = float(numerator / denominator)
+
+            result[y, x] = correlation
+
+    return result
 
 def tensor_to_cv_image(tensor_image):
     # Permute the tensor from [C, H, W] to [H, W, C]
@@ -263,55 +368,83 @@ def remove_watermark_batch(
 
     return corrected_frames
 
-def find_watermark_frame_cv(original_color):
-    global predictor, b2ab
-    load_models()
-    # Convert to grayscale
-    original_gray = cv2.cvtColor(original_color, cv2.COLOR_BGR2GRAY)
+def rgb_to_grayscale_torch(image: torch.Tensor) -> torch.Tensor:
+    """
+    image: [3, H, W]  (float in 0..1 or 0..255)
+    Returns: [H, W]   grayscale
+    """
+    # Weighted sum of RGB
+    # If your original images were BGR in OpenCV, be sure to correct order as needed.
+    # But typically with PyTorch we store color as RGB.
+    r = image[0]
+    g = image[1]
+    b = image[2]
+    gray = 0.299*r + 0.587*g + 0.114*b
+    return gray
 
-    # Template match to find initial position
-    res = cv2.matchTemplate(original_gray, template, cv2.TM_CCOEFF_NORMED, mask=mask)
-    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+
+def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
+    """
+    Replaces find_watermark_frame_cv() but uses only PyTorch on GPU.
+    original_color_torch: shape [3, H, W], float32, device='cuda'
+    """
+
+    load_models()
+
+    # Convert color -> grayscale
+    # If your original images were actually BGR, swap channels accordingly
+    original_gray_torch = rgb_to_grayscale_torch(original_color_torch)
+
+    # 1) Template match in PyTorch
+    res = match_template_torch(
+        original_gray_torch,  # shape [H, W]
+        template_tensor,       # shape [th, tw]
+        mask_tensor            # shape [th, tw], optional
+    )
     
-    # x, y = 129, 190
-    # logger.info(f"TEMP {min_loc}")
-    # if not pos_within_limits(min_loc[0], min_loc[1]):
-        # logger.error(f"Failed to find watermark position")
-        # return None
-    
-    h, w = border_map.shape
+    # 2) Replicate minMaxLoc
+    min_val, max_val, min_loc, max_loc = min_max_loc_torch(res)
+
+    # We'll search around min_loc in a small window
+    # In OpenCV, min_loc is (x, y).  That means:
+    init_x, init_y = min_loc  # (x, y)
+
+    h, w = border_tensor.shape[-2:]  # border_map size
     search_range = 2
 
     best_prob = float('inf')
     best_x = 0
     best_y = 0
 
-    # Search around the initial location to find best dx, dy
-    for dx in range(-search_range, search_range + 1):
-        for dy in range(-search_range, search_range + 1):
-            # x, y = 129, 190
-            x, y = min_loc
-            x += dx
-            y += dy
-            
-            corrected_image = remove_watermark_cv(original_color, x, y)
-            rgb_image = cv2.cvtColor(corrected_image, cv2.COLOR_BGR2RGB)
-            rgb_tensor = torch.from_numpy(rgb_image).to("cuda")
+    original_color_torch = original_color_torch.unsqueeze(0)
+    # 3) Search around initial location
+    for dx in range(-search_range, search_range+1):
+        for dy in range(-search_range, search_range+1):
+            x = init_x + dx
+            y = init_y + dy
 
-            result_prob = predictor.predict_tensor(rgb_tensor)
-            # logger.info(f"Trying {x} {y} = {result_prob}")
-            # Update best probability
+            # "Remove" watermark in a pure PyTorch manner
+            logger.info(f"original_color_torch {original_color_torch.shape}")
+            corrected_image_torch = remove_watermark_batch(original_color_torch, x, y)
+            
+            # predictor on GPU
+            # Suppose your predictor takes a [C, H, W] float32 in [0..1]
+            # and returns a float. (Adjust as needed.)
+            result_prob = predictor.predict_tensor(corrected_image_torch[0])
             if result_prob < best_prob:
                 best_prob = result_prob
                 best_x = x
                 best_y = y
 
-    # Compute final corrected image for this frame
-    final_corrected_image = remove_watermark_cv(original_color, best_x, best_y)
-    final_result = predictor.predict_cv(final_corrected_image)
+    # 4) Compute final corrected image
+    logger.info(f"original_color_torch 2 {original_color_torch.shape}")
+    final_corrected_image_torch = remove_watermark_batch(original_color_torch, best_x, best_y)
+    final_result = predictor.predict_tensor(final_corrected_image_torch[0])
+
     if final_result > 0.9:
         return None
-    return best_x, best_y, final_result
+
+    return best_x, best_y, float(final_result)
 
 def find_watermark_video(video_url, frame_range = range(0, 24, 5)):
     # Open video
@@ -363,43 +496,74 @@ def find_watermark_video(video_url, frame_range = range(0, 24, 5)):
     
     return most_common_position, final_result
 
-def find_watermark_tensor(pixel_values, frame_range = range(0, 24, 5)):
-    # We'll store results from each frame in this list
-    frame_positions = [] 
-    device='cuda'
-    pixel_values = pixel_values.to(device)
+def min_max_loc_torch(matrix: torch.Tensor):
+    """
+    Replicates cv2.minMaxLoc for a 2D PyTorch tensor.
+
+    Returns:
+        min_val, max_val (float)
+        min_loc, max_loc ((x, y) as in OpenCV)
+    """
+    # Flattened min / max
+    min_val = matrix.min()
+    max_val = matrix.max()
+    min_idx = torch.argmin(matrix)
+    max_idx = torch.argmax(matrix)
+
+    # Convert flat index -> 2D (y, x)
+    h, w = matrix.shape
+    min_y, min_x = divmod(min_idx.item(), w)
+    max_y, max_x = divmod(max_idx.item(), w)
+
+    # OpenCV returns (x, y)
+    return (min_val.item(),
+            max_val.item(),
+            (min_x, min_y),
+            (max_x, max_y))
+
+def find_watermark_tensor(pixel_values, frame_range=range(0, 24, 5)):
+    """
+    Replaces find_watermark_tensor but does all processing in PyTorch on GPU.
     
-    total_frames, _, _, _ = pixel_values.shape
+    pixel_values: shape [num_frames, 3, H, W], float32, device='cuda'
+    frame_range:  which frames to process
+    """
+    device = 'cuda'
+    pixel_values = pixel_values.to(device)
+
+    total_frames = pixel_values.shape[0]
+    frame_positions = []
+
     for frame_idx in frame_range:
-        if frame_idx > total_frames:
+        if frame_idx >= total_frames:
             break
-        cv_image = tensor_to_cv_image(pixel_values[frame_idx])
-        
-        res = find_watermark_frame_cv(cv_image)
+
+        # We no longer convert to OpenCV image
+        # We directly use the PyTorch tensor
+        frame_torch = pixel_values[frame_idx]  # shape [3, H, W]
+
+        res = find_watermark_frame_tensor(frame_torch)
         if not res:
             logger.error(f"{frame_idx} Failed to find")
             continue
+
         best_x, best_y, final_result = res
-        
-        # Store results
         frame_positions.append((best_x, best_y, final_result))
 
-    # If we got no frames, skip
+    # If no frames succeeded
     if not frame_positions:
         return None
 
-    # Majority vote on position (final_x, final_y)
-    # Extract just the positions (final_x, final_y)
+    # Majority vote on (x, y) location
     positions = [(fp[0], fp[1]) for fp in frame_positions]
     position_to_result = {(fp[0], fp[1]): fp[2] for fp in frame_positions}
-    # Count occurrences
     position_counts = Counter(positions)
-    # Most common position
-    most_common_position, res = position_counts.most_common(1)[0]
+    # Most common
+    most_common_position, _ = position_counts.most_common(1)[0]
     final_result = position_to_result[most_common_position]
 
     logger.info(f"MOST COMMON {most_common_position}, {final_result}")
-    
+
     return most_common_position[0], most_common_position[1], final_result
 
 def pos_within_limits(x, y):
