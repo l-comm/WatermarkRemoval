@@ -50,10 +50,7 @@ body_tensor = torch.from_numpy(body_map).float() / 255.0      # Shape: [H, W]
 border_tensor = border_tensor.to('cuda')
 body_tensor = body_tensor.to('cuda')
 
-template = body_map
 template_tensor = body_tensor
-_, mask = cv2.threshold(template, 6, 255, cv2.THRESH_BINARY)
-
 mask_tensor = (template_tensor > 6.0/255.0).float()
 
 # Directory for results
@@ -133,7 +130,7 @@ def save_pixel_values_as_video(pixel_values, output_path):
 
     logger.info(f"Video saved as {output_path}")
 
-def match_template_torch_fast(
+def match_template(
     image: torch.Tensor,
     template: torch.Tensor,
     mask: torch.Tensor = None,
@@ -250,143 +247,6 @@ def match_template_torch_fast(
 
     # Squeeze [1, 1, ...] -> [H-th+1, W-tw+1]
     return result_map.squeeze(0).squeeze(0)
-
-def match_template_torch(
-    image: torch.Tensor,
-    template: torch.Tensor,
-    mask: torch.Tensor = None
-) -> torch.Tensor:
-    """
-    Naïve PyTorch implementation of cv2.matchTemplate with method=cv2.TM_CCOEFF_NORMED.
-
-    Args:
-        image:   [H, W]   or [1, H, W]   float tensor, grayscale image.
-        template:[th, tw] or [1, th, tw] float tensor, grayscale template.
-        mask:    [th, tw] or [1, th, tw] float tensor in {0,1}, optional.
-
-    Returns:
-        A float tensor of shape [H - th + 1, W - tw + 1] containing
-        the normalized cross-correlation result at each valid (x,y).
-
-    Note:
-        - If input is [C,H,W], C must be 1 (grayscale).
-        - This code is NOT optimized for large images or large templates!
-        - Make sure to use float tensors for exact matching with OpenCV.
-    """
-    
-    # Ensure image and template are [H, W] shape, drop channel dimension if present
-    if image.dim() == 3 and image.size(0) == 1:
-        image = image.squeeze(0)
-    if template.dim() == 3 and template.size(0) == 1:
-        template = template.squeeze(0)
-    if mask is not None and mask.dim() == 3 and mask.size(0) == 1:
-        mask = mask.squeeze(0)
-
-    # Convert to float (if not already)
-    image    = image.float()
-    template = template.float()
-    if mask is not None:
-        mask = mask.float()
-
-    H,  W  = image.shape
-    th, tw = template.shape
-
-    # Prepare mask
-    if mask is None:
-        # Use a mask of all ones (same shape as template)
-        mask = torch.ones_like(template)
-    
-    # Make sure mask is binary in {0,1}
-    mask = (mask > 0).float()
-
-    # Number of valid (unmasked) pixels in the template
-    # shape: scalar
-    valid_count_template = mask.sum()
-
-    # If template is entirely masked out or has 0 valid pixels, avoid division by zero
-    if valid_count_template.item() < 1:
-        raise ValueError("Template mask has zero valid pixels.")
-
-    # Compute mean and "centered" template (masked)
-    # shape of t_mean: scalar
-    t_mean = (template * mask).sum() / valid_count_template
-    # shape: [th, tw]
-    t_centered = (template - t_mean) * mask
-    # sum of squares of the centered template
-    # shape: scalar
-    t_sum_sq = (t_centered ** 2).sum()
-
-    # Output correlation map
-    out_h = H - th + 1
-    out_w = W - tw + 1
-    result = torch.empty((out_h, out_w), dtype=torch.float32)
-
-    # Slide the template over image
-    for y in range(out_h):
-        for x in range(out_w):
-            # Extract the current patch from the image
-            # shape: [th, tw]
-            patch = image[y:y+th, x:x+tw]
-
-            # Compute the mask-aware mean of this patch
-            valid_count_patch = mask.sum()
-            i_mean = (patch * mask).sum() / valid_count_patch
-
-            # Center the patch by subtracting its mean (only where mask==1)
-            i_centered = (patch - i_mean) * mask
-
-            # Cross-term in numerator
-            numerator = (t_centered * i_centered).sum()
-
-            # Denominator is the product of sqrt of sums of squares
-            i_sum_sq = (i_centered ** 2).sum()
-            denominator = torch.sqrt(t_sum_sq * i_sum_sq + 1e-12)
-
-            # Avoid division by zero if patch is constant
-            if denominator.item() == 0.0:
-                # If the patch is fully masked or has zero variance, set correlation to 0
-                correlation = 0.0
-            else:
-                correlation = float(numerator / denominator)
-
-            result[y, x] = correlation
-
-    return result
-
-def tensor_to_cv_image(tensor_image):
-    # Permute the tensor from [C, H, W] to [H, W, C]
-    image_np = tensor_image.permute(1, 2, 0).cpu().numpy()
-    
-    # Scale the pixel values from [0, 1] to [0, 255]
-    image_np = (image_np * 255).astype(np.uint8)
-    
-    # Convert from RGB to BGR, as OpenCV expects BGR
-    return cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-
-def remove_watermark_cv(original_color, x, y, log = False):
-    # Convert to grayscale
-    original_gray = cv2.cvtColor(original_color, cv2.COLOR_BGR2GRAY)
-    h, w = border_map.shape
-    roi_gray = original_gray[y:y+h, x:x+w].astype(np.float32)
-
-    brightness = torch.tensor(roi_gray.mean(axis=(0,1))/255.).float().unsqueeze(0).unsqueeze(1).to('cuda')
-    alpha_beta = b2ab(brightness).squeeze(0).detach().cpu().numpy()
-    alpha = alpha_beta[0]
-    beta = alpha_beta[1]
-    corrected_roi = roi_gray - alpha*border_map.astype(np.float32) + beta*body_map.astype(np.float32)
-    corrected_roi = np.clip(corrected_roi, 0, 255).astype(np.uint8)
-    if log:
-        logger.info(f"brightness {brightness}")
-    difference = corrected_roi.astype(np.int16) - roi_gray.astype(np.int16)
-    roi_color = original_color[y:y+h, x:x+w].astype(np.int16)
-    difference_3d = difference[..., np.newaxis]
-    roi_color_corrected = roi_color + difference_3d
-    roi_color_corrected = np.clip(roi_color_corrected, 0, 255).astype(np.uint8)
-
-    final_corrected_image = original_color.copy()
-    final_corrected_image[y:y+h, x:x+w] = roi_color_corrected
-
-    return final_corrected_image
 
 def remove_watermark_batch(
     batch_frames: torch.Tensor,
@@ -515,7 +375,7 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
     original_gray_torch = rgb_to_grayscale_torch(original_color_torch)
 
     # 1) Template match in PyTorch
-    res = match_template_torch_fast(
+    res = match_template(
         original_gray_torch,  # shape [H, W]
         template_tensor,       # shape [th, tw]
         mask_tensor            # shape [th, tw], optional
@@ -564,56 +424,6 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
         return None
 
     return best_x, best_y, float(final_result)
-
-def find_watermark_video(video_url, frame_range = range(0, 24, 5)):
-    # Open video
-    cap = cv2.VideoCapture(video_url)
-    if not cap.isOpened():
-        print(f"Could not open video: {video_url}")
-        return None
-
-    # We'll store results from each frame in this list
-    frame_positions = [] 
-    
-    # Process the desired frames
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    for frame_idx in frame_range:
-        if frame_idx > total_frames:
-            break
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, original_color = cap.read()
-        if not ret:
-            print(f"Could not read frame {frame_idx} from {video_url}")
-            continue
-        
-        res = find_watermark_frame_cv(original_color)
-        if not res:
-            logger.error("Failed to find")
-            continue
-        best_x, best_y, final_result = res
-        
-        # Store results
-        frame_positions.append((best_x, best_y, final_result))
-
-    cap.release()
-
-    # If we got no frames, skip
-    if not frame_positions:
-        return None
-
-    # Majority vote on position (final_x, final_y)
-    # Extract just the positions (final_x, final_y)
-    positions = [(fp[0], fp[1]) for fp in frame_positions]
-    position_to_result = {(fp[0], fp[1]): fp[2] for fp in frame_positions}
-    # Count occurrences
-    position_counts = Counter(positions)
-    # Most common position
-    most_common_position, _ = position_counts.most_common(1)[0]
-    final_result = position_to_result[most_common_position]
-    
-    logger.info(f"MOST COMMON {most_common_position}, {final_result}")
-    
-    return most_common_position, final_result
 
 def min_max_loc_torch(matrix: torch.Tensor):
     """
@@ -685,55 +495,6 @@ def find_watermark_tensor(pixel_values, frame_range=range(0, 24, 5)):
 
     return most_common_position[0], most_common_position[1], final_result
 
-def pos_within_limits(x, y):
-    if x < 120 or x > 150 or y < 170 or y > 210:
-        return False
-    return True
-
-def find_watermark_test_cv():
-    global predictor, b2ab
-    load_models()
-    
-    # Directory with videos
-    video_dir = os.path.join(current_dir, 'watermarked_videos')
-    video_files = [f for f in os.listdir(video_dir) if os.path.isfile(os.path.join(video_dir, f))]
-    
-    # Prepare CSV file
-    csv_path = os.path.join(current_dir,'watermark_locations.csv')
-
-    with open(csv_path, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        # Write header: video_path, final_x, final_y, final_best_dx, final_best_dy, final_watermark_probability
-        writer.writerow(['video_path', 'x', 'y' ,'final_watermark_probability'])
-
-        for video_file in video_files:
-            video_path = os.path.join(video_dir, video_file)
-            print(f"Processing {video_path}")
-            res = find_watermark_video(video_path)
-            if not res:
-                continue
-            final_x, final_y = res
-
-            # Open video
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"Could not open video: {video_path}")
-                continue
-            ret, original_color = cap.read()
-
-            final_corrected_image = remove_watermark_cv(original_color, final_x, final_y, log=True)
-            final_result = predictor.predict_cv(final_corrected_image)
-            
-            # Save the corrected image
-            base_name = os.path.splitext(video_file)[0]
-            corrected_image_path = os.path.join(results_dir, f"{base_name}_corrected.jpg")
-            cv2.imwrite(corrected_image_path, final_corrected_image)
-            
-            # Write results to CSV
-            writer.writerow([video_path, final_x, final_y, final_result.item()])
-            print(f"Processed {video_path} - Majority Watermark at {final_x}, {final_y}, prob: {final_result.item()}")
-            print(f"Corrected image saved at {corrected_image_path}")
-
 def find_watermark_test_tensor():
     # Directory with videos
     video_dir = os.path.join(current_dir, 'watermarked_videos')
@@ -776,11 +537,5 @@ def find_watermark_test_tensor():
         corrected_path = os.path.join(results_dir, f"{base_name}_corrected.mp4")
         save_pixel_values_as_video(pixel_values, corrected_path)
 
-        
-
-        # final_corrected_image = remove_watermark_cv(original_color, final_x, final_y)
-        # final_result = predictor.predict_cv(final_corrected_image)
-
 if __name__ == "__main__":
     find_watermark_test_tensor()
-    # find_watermark_test_cv()
