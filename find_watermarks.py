@@ -16,6 +16,7 @@ import torchaudio
 from .models.brightness_predictor import BrightnessToAlphaBeta
 from .models.watermark_detector import WatermarkDetector
 from collections import Counter
+import torch.nn.functional as F
 
 console = Console(highlight=True)
 logging.basicConfig(
@@ -131,6 +132,124 @@ def save_pixel_values_as_video(pixel_values, output_path):
         writer.close()
 
     logger.info(f"Video saved as {output_path}")
+
+def match_template_torch_fast(
+    image: torch.Tensor,
+    template: torch.Tensor,
+    mask: torch.Tensor = None,
+    eps: float = 1e-12
+) -> torch.Tensor:
+    """
+    High-performance PyTorch implementation of cv2.matchTemplate 
+    with method=cv2.TM_CCOEFF_NORMED, using 2D convolutions on GPU.
+
+    Args:
+        image:    Float tensor [H, W] or [1, H, W], grayscale image.
+        template: Float tensor [th, tw] or [1, th, tw], grayscale template.
+        mask:     Float tensor [th, tw] or [1, th, tw], binary {0,1}, optional.
+        eps:      Small constant to avoid division by zero.
+
+    Returns:
+        result:   A float tensor [H - th + 1, W - tw + 1] with 
+                  the normalized cross-correlation scores.
+    """
+    # -------------------------------------------------------------------------
+    # Preprocessing and shape handling
+    # -------------------------------------------------------------------------
+    # Ensure image shape is [1, H, W]
+    if image.dim() == 2:
+        image = image.unsqueeze(0)
+    elif image.dim() == 3 and image.size(0) == 1:
+        pass  # shape is already [1, H, W]
+    else:
+        raise ValueError("image must be [H, W] or [1, H, W] with grayscale data.")
+    _, H, W = image.shape
+
+    # Ensure template shape is [th, tw]
+    if template.dim() == 2:
+        pass  # shape is already [th, tw]
+    elif template.dim() == 3 and template.size(0) == 1:
+        template = template.squeeze(0)
+    else:
+        raise ValueError("template must be [th, tw] or [1, th, tw].")
+    th, tw = template.shape
+
+    # Handle mask
+    if mask is None:
+        # Use a mask of all ones
+        mask = torch.ones_like(template)
+    else:
+        if mask.dim() == 3 and mask.size(0) == 1:
+            mask = mask.squeeze(0)
+        if mask.shape != template.shape:
+            raise ValueError("mask must have the same spatial shape as template.")
+    mask = (mask > 0).float()  # ensure binary in {0,1}
+
+    # Move everything to the same device & float (in case user wants GPU)
+    device = image.device
+    image = image.float().to(device)
+    template = template.float().to(device)
+    mask = mask.float().to(device)
+
+    # -------------------------------------------------------------------------
+    # Compute template statistics (masked)
+    # -------------------------------------------------------------------------
+    valid_count_template = mask.sum()
+    if valid_count_template < 1:
+        raise ValueError("Template mask has zero valid pixels.")
+
+    t_mean = (template * mask).sum() / valid_count_template
+    # Centered template: (T - mean) * mask
+    t_centered = (template - t_mean) * mask
+    # Sum of squares of template
+    t_sum_sq = (t_centered ** 2).sum()
+
+    # -------------------------------------------------------------------------
+    # Prepare convolution kernels and image for conv2d
+    # -------------------------------------------------------------------------
+    # We will treat image as [N=1, C=1, H, W] so that F.conv2d can work directly.
+    # Convert template, mask into [out_channels=1, in_channels=1, th, tw]
+    image_4d = image.unsqueeze(0)  # [1, 1, H, W]
+    t_centered_4d = t_centered.unsqueeze(0).unsqueeze(0)  # [1,1,th,tw]
+    mask_4d = mask.unsqueeze(0).unsqueeze(0)              # [1,1,th,tw]
+
+    # -------------------------------------------------------------------------
+    # Convolution for cross-term: sum over patch [ I * (T - mean(T)) ]
+    # -------------------------------------------------------------------------
+    # cross_map shape => [1, 1, H - th + 1, W - tw + 1]
+    cross_map = F.conv2d(image_4d, t_centered_4d)
+
+    # -------------------------------------------------------------------------
+    # Convolution for sums in the image patch (with mask):
+    #   i_sum: sum over patch [ I * mask ]
+    #   i2_sum: sum over patch [ I^2 * mask ]
+    # -------------------------------------------------------------------------
+    i_sum = F.conv2d(image_4d, mask_4d)         # sum of I * mask
+    i2_sum = F.conv2d(image_4d ** 2, mask_4d)   # sum of I^2 * mask
+
+    # -------------------------------------------------------------------------
+    # Mean and variance for each patch
+    #
+    # i_mean = i_sum / valid_count_template
+    # var(I) = sum((I - i_mean)^2 * mask)
+    #         = sum(I^2 * mask) - i_sum^2 / valid_count_template
+    # -------------------------------------------------------------------------
+    i_mean = i_sum / valid_count_template
+    i_var = i2_sum - (i_sum ** 2) / valid_count_template
+
+    # -------------------------------------------------------------------------
+    # Denominator = sqrt( sum((T - t_mean)^2) * var(I) ), broadcast
+    # -------------------------------------------------------------------------
+    denominator = torch.sqrt(t_sum_sq * i_var + eps)
+
+    # -------------------------------------------------------------------------
+    # Normalized cross-correlation map
+    # -------------------------------------------------------------------------
+    # shape => [1, 1, H-th+1, W-tw+1]
+    result_map = cross_map / denominator
+
+    # Squeeze [1, 1, ...] -> [H-th+1, W-tw+1]
+    return result_map.squeeze(0).squeeze(0)
 
 def match_template_torch(
     image: torch.Tensor,
@@ -327,7 +446,7 @@ def remove_watermark_batch(
         border_tensor_expanded = border_tensor.unsqueeze(0).expand(b, -1, -1)
         body_tensor_expanded = body_tensor.unsqueeze(0).expand(b, -1, -1)
 
-        logger.info(f"roi gray {roi_gray.shape} - alpha {alpha.shape} - border {border_tensor_expanded.shape}")
+        # logger.info(f"roi gray {roi_gray.shape} - alpha {alpha.shape} - border {border_tensor_expanded.shape}")
 
         # Compute corrected ROI in grayscale
         corrected_roi = roi_gray - (alpha * border_tensor_expanded) + (beta * body_tensor_expanded)
@@ -396,7 +515,7 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
     original_gray_torch = rgb_to_grayscale_torch(original_color_torch)
 
     # 1) Template match in PyTorch
-    res = match_template_torch(
+    res = match_template_torch_fast(
         original_gray_torch,  # shape [H, W]
         template_tensor,       # shape [th, tw]
         mask_tensor            # shape [th, tw], optional
@@ -424,7 +543,7 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
             y = init_y + dy
 
             # "Remove" watermark in a pure PyTorch manner
-            logger.info(f"original_color_torch {original_color_torch.shape}")
+            # logger.info(f"original_color_torch {original_color_torch.shape}")
             corrected_image_torch = remove_watermark_batch(original_color_torch, x, y)
             
             # predictor on GPU
@@ -437,7 +556,7 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
                 best_y = y
 
     # 4) Compute final corrected image
-    logger.info(f"original_color_torch 2 {original_color_torch.shape}")
+    # logger.info(f"original_color_torch 2 {original_color_torch.shape}")
     final_corrected_image_torch = remove_watermark_batch(original_color_torch, best_x, best_y)
     final_result = predictor.predict_tensor(final_corrected_image_torch[0])
 
