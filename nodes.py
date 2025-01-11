@@ -39,7 +39,7 @@ class FindWatermarkNode:
             Tuple[int, int, str]: x-coordinate, y-coordinate, and detection score.
         """
         # Call your existing watermark detection function
-        result = find_watermarks.find_watermark_tensor(images.permute(0, 3, 1, 2))
+        result = find_watermarks.find_watermark_tensor(images.permute(0, 3, 1, 2), result_cutoff=1.0)
 
         if not result:
             # If no watermark found, return default values
@@ -67,6 +67,7 @@ class RemoveWatermarkNode:
             "optional": {
                 "x": ("INT", {"forceInput":True}),
                 "y": ("INT", {"forceInput":True}),
+                "score": ("STRING", {"forceInput":True, "default": ""}),
                 "nudge_x": ("INT", {"default": 0, "min": -999999, "max": 999999, "step": 1}),
                 "nudge_y": ("INT", {"default": 0, "min": -999999, "max": 999999, "step": 1}),
             }
@@ -77,12 +78,13 @@ class RemoveWatermarkNode:
     FUNCTION = "remove_watermark"
     CATEGORY = "Video/Watermarks"
 
-    def remove_watermark(self, images, x=0, y=0, nudge_x=0, nudge_y=0):
+    def remove_watermark(self, images, x=0, y=0, score="", nudge_x=0, nudge_y=0):
         """
         Args:
             images (list of PIL.Image): Batch of input images.
             x (int): x-coordinate of the watermark.
             y (int): y-coordinate of the watermark.
+            score (string): lets the detector tell us if it failed
             nudge_x (int): Additional x nudge value.
             nudge_y (int): Additional y nudge value.
 
@@ -93,6 +95,8 @@ class RemoveWatermarkNode:
         y += nudge_y
 
         # Call your existing watermark removal function
-        corrected_frames = find_watermarks.remove_watermark_batch(images.permute(0, 3, 1, 2), x, y)
+        if score != "Failed":
+            corrected_frames = find_watermarks.remove_watermark_batch(images.permute(0, 3, 1, 2), x, y)
+            images = corrected_frames.permute(0, 2, 3, 1)
 
-        return (corrected_frames.permute(0, 2, 3, 1),)
+        return (images,)

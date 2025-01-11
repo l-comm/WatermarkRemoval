@@ -362,7 +362,7 @@ def rgb_to_grayscale_torch(image: torch.Tensor) -> torch.Tensor:
     return gray
 
 
-def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
+def find_watermark_frame_tensor(original_color_torch: torch.Tensor, result_cutoff=0.9):
     """
     Replaces find_watermark_frame_cv() but uses only PyTorch on GPU.
     original_color_torch: shape [3, H, W], float32, device='cuda'
@@ -419,8 +419,8 @@ def find_watermark_frame_tensor(original_color_torch: torch.Tensor):
     # logger.info(f"original_color_torch 2 {original_color_torch.shape}")
     final_corrected_image_torch = remove_watermark_batch(original_color_torch, best_x, best_y)
     final_result = predictor.predict_tensor(final_corrected_image_torch[0])
-
-    if final_result > 0.9:
+    print(f"final {final_result}")
+    if final_result > result_cutoff:
         return None
 
     return best_x, best_y, float(final_result)
@@ -450,7 +450,7 @@ def min_max_loc_torch(matrix: torch.Tensor):
             (min_x, min_y),
             (max_x, max_y))
 
-def find_watermark_tensor(pixel_values, frame_range=range(0, 24, 5)):
+def find_watermark_tensor(pixel_values, frame_range=range(0, 24, 5), result_cutoff=0.9):
     """
     Replaces find_watermark_tensor but does all processing in PyTorch on GPU.
     
@@ -471,7 +471,7 @@ def find_watermark_tensor(pixel_values, frame_range=range(0, 24, 5)):
         # We directly use the PyTorch tensor
         frame_torch = pixel_values[frame_idx]  # shape [3, H, W]
 
-        res = find_watermark_frame_tensor(frame_torch)
+        res = find_watermark_frame_tensor(frame_torch, result_cutoff)
         if not res:
             logger.error(f"{frame_idx} Failed to find")
             continue
