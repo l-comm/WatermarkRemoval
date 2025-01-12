@@ -28,7 +28,7 @@ class FindWatermarkNode:
     RETURN_TYPES = ("INT", "INT", "STRING")
     RETURN_NAMES = ("x", "y", "score")
     FUNCTION = "find_watermark"
-    CATEGORY = "Video/Watermarks"
+    CATEGORY = "Watermark Removal"
 
     def find_watermark(self, images):
         """
@@ -76,7 +76,7 @@ class RemoveWatermarkNode:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images_corrected",)
     FUNCTION = "remove_watermark"
-    CATEGORY = "Video/Watermarks"
+    CATEGORY = "Watermark Removal"
 
     def remove_watermark(self, images, x=0, y=0, score="", nudge_x=0, nudge_y=0):
         """
